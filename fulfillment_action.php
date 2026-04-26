@@ -2,316 +2,674 @@
 declare(strict_types=1);
 
 if (session_status() !== PHP_SESSION_ACTIVE) {
-    session_start();
+    @session_start();
 }
 
-$baseDir = dirname(__DIR__, 1);
-$dbLoaded = false;
+$root = dirname(__DIR__);
+$sellerRoot = __DIR__;
 
-$dbCandidates = [
-    $baseDir . '/config/db.php',
-    $baseDir . '/includes/db.php',
-    dirname($baseDir) . '/config/db.php',
-    dirname($baseDir) . '/includes/db.php',
-];
-
-foreach ($dbCandidates as $dbFile) {
-    if (is_file($dbFile)) {
-        require_once $dbFile;
-        $dbLoaded = true;
-        break;
+foreach ([
+    $sellerRoot . '/_guard.php',
+    $sellerRoot . '/guard.php',
+    $root . '/includes/auth.php',
+    $root . '/includes/auth_bootstrap.php',
+    $root . '/config/db.php',
+    $root . '/includes/db.php',
+] as $file) {
+    if (is_file($file)) {
+        require_once $file;
     }
 }
 
-if (!$dbLoaded) {
-    http_response_code(500);
-    exit('Database configuration not found.');
+function bvfa_h($v): string {
+    return htmlspecialchars((string)$v, ENT_QUOTES, 'UTF-8');
 }
 
-$pdo = null;
-if (isset($pdo) && $pdo instanceof PDO) {
-    // already set
-} elseif (isset($db) && $db instanceof PDO) {
-    $pdo = $db;
-} elseif (isset($conn) && $conn instanceof PDO) {
-    $pdo = $conn;
+function bvfa_db(): PDO {
+    foreach ([$GLOBALS['pdo'] ?? null, $GLOBALS['PDO'] ?? null, $GLOBALS['db'] ?? null, $GLOBALS['conn'] ?? null] as $db) {
+        if ($db instanceof PDO) {
+            return $db;
+        }
+    }
+    throw new RuntimeException('PDO connection not found.');
 }
 
-if (!$pdo instanceof PDO) {
-    http_response_code(500);
-    exit('Database connection is unavailable.');
+function bvfa_current_seller_id(): int {
+    foreach ([
+        $_SESSION['user']['id'] ?? null,
+        $_SESSION['seller']['id'] ?? null,
+        $_SESSION['member']['id'] ?? null,
+        $_SESSION['user_id'] ?? null,
+        $_SESSION['member_id'] ?? null,
+    ] as $id) {
+        if (is_numeric($id) && (int)$id > 0) {
+            return (int)$id;
+        }
+    }
+    return 0;
 }
 
-$pdo->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
+function bvfa_redirect(string $url): void {
+    header('Location: ' . $url);
+    exit;
+}
 
-function seller_redirect_with_flash(string $type, string $message, string $fallbackUrl, ?string $returnUrl = null): void
-{
+function bvfa_safe_return_url(): string {
+    $url = trim((string)($_POST['return_url'] ?? '/seller/orders.php'));
+
+    if ($url === '' || preg_match('~^[a-z][a-z0-9+\-.]*://~i', $url) || str_starts_with($url, '//')) {
+        return '/seller/orders.php';
+    }
+
+    if (strpos($url, "\r") !== false || strpos($url, "\n") !== false) {
+        return '/seller/orders.php';
+    }
+
+    return $url;
+}
+
+function bvfa_flash(string $type, string $message): void {
     $_SESSION['seller_fulfillment_flash'] = [
         'type' => $type,
         'message' => $message,
     ];
+}
 
-    $target = $fallbackUrl;
-    if (is_string($returnUrl) && $returnUrl !== '') {
-        $parts = parse_url($returnUrl);
-        $isLocal = isset($parts['path']) && strpos((string)$parts['path'], '/') === 0 && !isset($parts['scheme']) && !isset($parts['host']);
-        if ($isLocal) {
-            $target = $returnUrl;
+function bvfa_columns(PDO $pdo, string $table): array {
+    static $cache = [];
+
+    if (isset($cache[$table])) {
+        return $cache[$table];
+    }
+
+    $cols = [];
+    try {
+        $stmt = $pdo->query("SHOW COLUMNS FROM `{$table}`");
+        while ($row = $stmt->fetch(PDO::FETCH_ASSOC)) {
+            if (!empty($row['Field'])) {
+                $cols[$row['Field']] = true;
+            }
+        }
+    } catch (Throwable $e) {
+        // ignore
+    }
+
+    return $cache[$table] = $cols;
+}
+
+function bvfa_has_col(PDO $pdo, string $table, string $col): bool {
+    $cols = bvfa_columns($pdo, $table);
+    return isset($cols[$col]);
+}
+
+function bvfa_table_exists(PDO $pdo, string $table): bool {
+    try {
+        $stmt = $pdo->prepare('SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = DATABASE() AND table_name = ?');
+        $stmt->execute([$table]);
+        return (int)$stmt->fetchColumn() > 0;
+    } catch (Throwable $e) {
+        return false;
+    }
+}
+
+function bvfa_verify_csrf(): bool {
+    $posted = (string)($_POST['csrf_token'] ?? '');
+
+    if ($posted === '') {
+        return false;
+    }
+
+    foreach ([
+        $_SESSION['csrf_token'] ?? null,
+        $_SESSION['_csrf_seller_order']['fulfillment'] ?? null,
+        $_SESSION['_csrf_seller_fulfillment'] ?? null,
+    ] as $token) {
+        if (is_string($token) && $token !== '' && hash_equals($token, $posted)) {
+            return true;
         }
     }
 
-    header('Location: ' . $target);
-    exit;
+    return false;
 }
 
-function detect_actor(array $session): array
+function bvfa_fetch_item_for_update(PDO $pdo, int $orderItemId, int $sellerId): ?array {
+    $orderItemCols = bvfa_columns($pdo, 'order_items');
+
+    $joinListing = isset($orderItemCols['listing_id']);
+    $sellerFilter = '';
+
+    if (isset($orderItemCols['seller_id'])) {
+        $sellerFilter = 'oi.`seller_id` = :seller_id';
+    } elseif (isset($orderItemCols['seller_user_id'])) {
+        $sellerFilter = 'oi.`seller_user_id` = :seller_id';
+    } elseif ($joinListing) {
+        $sellerFilter = 'l.`seller_id` = :seller_id';
+    } else {
+        throw new RuntimeException('Cannot verify seller ownership for this order item.');
+    }
+
+    // Buyer email: check which column exists in orders
+    $orderCols = bvfa_columns($pdo, 'orders');
+    $buyerEmailExpr = 'NULL';
+    foreach (['buyer_email', 'email', 'customer_email', 'ship_email'] as $_bec) {
+        if (isset($orderCols[$_bec])) {
+            $buyerEmailExpr = "o.`{$_bec}`";
+            break;
+        }
+    }
+    // Buyer name: best-effort
+    $buyerNameExpr = 'NULL';
+    foreach (['buyer_name', 'customer_name', 'ship_name', 'name'] as $_bnc) {
+        if (isset($orderCols[$_bnc])) {
+            $buyerNameExpr = "o.`{$_bnc}`";
+            break;
+        }
+    }
+
+    $sql = "
+        SELECT
+            oi.*,
+            o.status AS order_status,
+            o.payment_status AS payment_status,
+            o.order_code AS order_code,
+            {$buyerEmailExpr} AS _buyer_email,
+            {$buyerNameExpr} AS _buyer_name
+            " . ($joinListing ? ", l.seller_id AS listing_seller_id, l.title AS _listing_title" : "") . "
+        FROM order_items oi
+        INNER JOIN orders o ON o.id = oi.order_id
+        " . ($joinListing ? "LEFT JOIN listings l ON l.id = oi.listing_id" : "") . "
+        WHERE oi.id = :order_item_id
+          AND {$sellerFilter}
+        LIMIT 1
+        FOR UPDATE
+    ";
+
+    $stmt = $pdo->prepare($sql);
+    $stmt->execute([
+        ':order_item_id' => $orderItemId,
+        ':seller_id' => $sellerId,
+    ]);
+
+    $row = $stmt->fetch(PDO::FETCH_ASSOC);
+    return $row ?: null;
+}
+
+function bvfa_log_item(PDO $pdo, int $orderItemId, string $action, string $oldStatus, string $newStatus, int $actorId): void {
+    if (!bvfa_table_exists($pdo, 'order_item_logs')) {
+        return;
+    }
+
+    $stmt = $pdo->prepare("
+        INSERT INTO order_item_logs
+            (order_item_id, action, old_status, new_status, actor_type, actor_id, created_at)
+        VALUES
+            (?, ?, ?, ?, 'seller', ?, NOW())
+    ");
+    $stmt->execute([$orderItemId, $action, $oldStatus, $newStatus, $actorId]);
+}
+
+function bvfa_update_order_rollup(PDO $pdo, int $orderId): void {
+    if (!bvfa_has_col($pdo, 'orders', 'status')) {
+        return;
+    }
+
+    $stmt = $pdo->prepare("
+        SELECT fulfillment_status, COUNT(*) AS c
+        FROM order_items
+        WHERE order_id = ?
+        GROUP BY fulfillment_status
+    ");
+    $stmt->execute([$orderId]);
+    $rows = $stmt->fetchAll(PDO::FETCH_ASSOC);
+
+    if (!$rows) {
+        return;
+    }
+
+    $counts = [];
+    $total = 0;
+
+    foreach ($rows as $row) {
+        $status = strtolower((string)($row['fulfillment_status'] ?? 'pending'));
+        $count = (int)($row['c'] ?? 0);
+        $counts[$status] = $count;
+        $total += $count;
+    }
+
+    if ($total <= 0) {
+        return;
+    }
+
+    $newOrderStatus = null;
+
+    if (($counts['completed'] ?? 0) === $total) {
+        $newOrderStatus = 'completed';
+    } elseif (($counts['shipped'] ?? 0) > 0 || ($counts['completed'] ?? 0) > 0) {
+        $newOrderStatus = 'shipped';
+    } elseif (($counts['processing'] ?? 0) > 0) {
+        $newOrderStatus = 'processing';
+    }
+
+    if ($newOrderStatus) {
+        $stmt = $pdo->prepare("UPDATE orders SET status = ? WHERE id = ?");
+        $stmt->execute([$newOrderStatus, $orderId]);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Shipped email helpers — buyer notification on fulfillment.shipped
+// ---------------------------------------------------------------------------
+
+function bvfa_mail_log(string $event, array $context = []): void
 {
-    $idCandidates = [
-        $session['user']['id'] ?? null,
-        $session['auth_user']['id'] ?? null,
-        $session['member']['id'] ?? null,
-        $session['seller']['id'] ?? null,
-        $session['user_id'] ?? null,
-        $session['member_id'] ?? null,
-        $session['seller_id'] ?? null,
+    $paths = [
+        dirname(dirname(__DIR__)) . '/private_html/seller_fulfillment_mail.log',
+        dirname(__DIR__) . '/seller_fulfillment_mail.log',
+        __DIR__ . '/seller_fulfillment_mail.log',
     ];
-
-    $sellerId = null;
-    foreach ($idCandidates as $candidate) {
-        if ($candidate !== null && $candidate !== '' && ctype_digit((string)$candidate)) {
-            $sellerId = (int)$candidate;
-            break;
+    $line = '[' . gmdate('Y-m-d H:i:s') . ' UTC] ' . $event;
+    if ($context !== []) {
+        $json = json_encode($context, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+        if (is_string($json) && $json !== '') {
+            $line .= ' ' . $json;
         }
     }
-
-    $roleCandidates = [
-        $session['user']['role'] ?? null,
-        $session['auth_user']['role'] ?? null,
-        $session['member']['role'] ?? null,
-        $session['seller']['role'] ?? null,
-        $session['role'] ?? null,
-        $session['user_role'] ?? null,
-        $session['member_role'] ?? null,
-    ];
-
-    $role = null;
-    foreach ($roleCandidates as $candidate) {
-        if (is_string($candidate) && $candidate !== '') {
-            $role = strtolower(trim($candidate));
-            break;
+    $line .= "\n";
+    foreach ($paths as $logPath) {
+        $dir = dirname($logPath);
+        if (!is_dir($dir)) {
+            continue;
+        }
+        if (is_file($logPath) || is_writable($dir)) {
+            @file_put_contents($logPath, $line, FILE_APPEND);
+            return;
         }
     }
-
-    $isAdmin = in_array($role, ['admin', 'superadmin', 'super_admin'], true);
-    $isSeller = in_array($role, ['seller', 'vendor', 'merchant'], true) || isset($session['seller']) || isset($session['seller_id']);
-
-    return [$sellerId, $isSeller, $isAdmin];
 }
 
-if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
-    http_response_code(405);
-    exit('Method not allowed');
-}
-
-[$actorId, $isSeller, $isAdmin] = detect_actor($_SESSION);
-
-if (!$actorId || (!$isSeller && !$isAdmin)) {
-    http_response_code(403);
-    exit('Forbidden');
-}
-
-$sessionCsrf = $_SESSION['_csrf_seller_order']['fulfillment'] ?? '';
-$postCsrf = isset($_POST['csrf_token']) ? (string)$_POST['csrf_token'] : '';
-
-if (!is_string($sessionCsrf) || $sessionCsrf === '' || $postCsrf === '' || !hash_equals($sessionCsrf, $postCsrf)) {
-    http_response_code(403);
-    exit('Invalid CSRF token');
-}
-
-$orderItemId = isset($_POST['order_item_id']) ? (int)$_POST['order_item_id'] : 0;
-$action = isset($_POST['action']) ? strtolower(trim((string)$_POST['action'])) : '';
-$carrier = trim((string)($_POST['carrier'] ?? ''));
-$trackingNumber = trim((string)($_POST['tracking_number'] ?? ''));
-$fulfillmentNote = trim((string)($_POST['fulfillment_note'] ?? ''));
-$returnUrl = isset($_POST['return_url']) ? (string)$_POST['return_url'] : null;
-
-if ($orderItemId <= 0 || !in_array($action, ['process', 'ship', 'complete'], true)) {
-    seller_redirect_with_flash('error', 'Invalid fulfillment request.', '/seller/orders.php', $returnUrl);
-}
-
-$stmt = $pdo->prepare(
-    'SELECT oi.*, l.seller_id AS listing_seller_id, l.title AS listing_title
-     FROM order_items oi
-     JOIN listings l ON l.id = oi.listing_id
-     WHERE oi.id = ?
-     LIMIT 1'
-);
-$stmt->execute([$orderItemId]);
-$orderItem = $stmt->fetch(PDO::FETCH_ASSOC);
-
-if (!$orderItem) {
-    seller_redirect_with_flash('error', 'Order item not found.', '/seller/orders.php', $returnUrl);
-}
-
-$itemOrderId = (int)($orderItem['order_id'] ?? 0);
-$fallbackUrl = '/seller/order_detail.php?id=' . $itemOrderId;
-
-$itemSellerId = (int)($orderItem['listing_seller_id'] ?? 0);
-if (!$isAdmin && $itemSellerId !== $actorId) {
-    http_response_code(403);
-    exit('Forbidden');
-}
-
-$currentStatus = strtolower((string)($orderItem['fulfillment_status'] ?? 'pending'));
-$allowedTransitions = [
-    'process' => ['from' => ['pending'], 'to' => 'processing'],
-    'ship' => ['from' => ['pending', 'processing'], 'to' => 'shipped'],
-    'complete' => ['from' => ['shipped'], 'to' => 'completed'],
-];
-
-if (in_array($currentStatus, ['completed', 'cancelled'], true)) {
-    seller_redirect_with_flash('error', 'This item can no longer be updated.', $fallbackUrl, $returnUrl);
-}
-
-$transition = $allowedTransitions[$action];
-if (!in_array($currentStatus, $transition['from'], true)) {
-    seller_redirect_with_flash('error', 'Invalid fulfillment status transition.', $fallbackUrl, $returnUrl);
-}
-
-if ($action === 'ship' && $trackingNumber === '') {
-    seller_redirect_with_flash('error', 'Tracking number is required to mark as shipped.', $fallbackUrl, $returnUrl);
-}
-
-$now = (new DateTimeImmutable('now'))->format('Y-m-d H:i:s');
-$newStatus = $transition['to'];
-
-$updateParts = ['fulfillment_status = :new_status', 'fulfillment_note = :fulfillment_note'];
-$params = [
-    ':new_status' => $newStatus,
-    ':fulfillment_note' => $fulfillmentNote !== '' ? $fulfillmentNote : null,
-    ':id' => $orderItemId,
-];
-
-if ($action === 'process') {
-    $updateParts[] = 'processed_at = :processed_at';
-    $params[':processed_at'] = $now;
-}
-
-if ($action === 'ship') {
-    $updateParts[] = 'carrier = :carrier';
-    $updateParts[] = 'tracking_number = :tracking_number';
-    $updateParts[] = 'shipped_at = :shipped_at';
-    $params[':carrier'] = $carrier !== '' ? mb_substr($carrier, 0, 80) : null;
-    $params[':tracking_number'] = mb_substr($trackingNumber, 0, 120);
-    $params[':shipped_at'] = $now;
-}
-
-if ($action === 'complete') {
-    $updateParts[] = 'completed_at = :completed_at';
-    $params[':completed_at'] = $now;
-}
-
-$logTableExists = false;
-try {
-    $checkLogStmt = $pdo->query("SHOW TABLES LIKE 'order_item_logs'");
-    $logTableExists = (bool)$checkLogStmt->fetchColumn();
-} catch (Throwable $e) {
-    $logTableExists = false;
-}
-
-$pdo->beginTransaction();
-
-try {
-    $reReadStmt = $pdo->prepare(
-        'SELECT oi.*, l.seller_id AS listing_seller_id, l.title AS listing_title
-         FROM order_items oi
-         JOIN listings l ON l.id = oi.listing_id
-         WHERE oi.id = ?
-         LIMIT 1'
-    );
-    $reReadStmt->execute([$orderItemId]);
-    $freshItem = $reReadStmt->fetch(PDO::FETCH_ASSOC);
-
-    if (!$freshItem) {
-        throw new RuntimeException('Order item no longer exists.');
+function bvfa_load_mailer(): void
+{
+    $root = dirname(__DIR__);
+    foreach ([
+        $root . '/includes/mailer.php',
+        $root . '/includes/mail.php',
+        $root . '/includes/mailer/mailer.php',
+        $root . '/lib/mailer.php',
+    ] as $f) {
+        if (is_file($f)) {
+            require_once $f;
+            return;
+        }
     }
+}
 
-    $freshStatus = strtolower((string)($freshItem['fulfillment_status'] ?? 'pending'));
-    $freshSellerId = (int)($freshItem['listing_seller_id'] ?? 0);
-
-    if (!$isAdmin && $freshSellerId !== $actorId) {
-        throw new RuntimeException('You do not have permission to update this item.');
+function bvfa_find_buyer_email(array $item): string
+{
+    $email = trim((string)($item['_buyer_email'] ?? ''));
+    if ($email !== '' && filter_var($email, FILTER_VALIDATE_EMAIL)) {
+        return $email;
     }
+    return '';
+}
 
-    if (!in_array($freshStatus, $transition['from'], true)) {
-        throw new RuntimeException('Status transition is no longer valid. Please refresh and try again.');
+function bvfa_build_member_order_url(int $orderId): string
+{
+    if ($orderId <= 0) {
+        return '/member/orders.php';
     }
+    return '/member/order_detail.php?id=' . $orderId;
+}
 
-    $updateSql = 'UPDATE order_items SET ' . implode(', ', $updateParts) . ' WHERE id = :id';
-    $updateStmt = $pdo->prepare($updateSql);
-    $updateStmt->execute($params);
+function bvfa_shipped_email_already_queued(PDO $pdo, int $orderItemId): bool
+{
+    if (!bvfa_table_exists($pdo, 'order_item_logs')) {
+        return false;
+    }
+    try {
+        $stmt = $pdo->prepare("
+            SELECT COUNT(*) FROM order_item_logs
+            WHERE order_item_id = ? AND action = 'shipped_email_queued'
+            LIMIT 1
+        ");
+        $stmt->execute([$orderItemId]);
+        return (int)$stmt->fetchColumn() > 0;
+    } catch (Throwable $e) {
+        return false;
+    }
+}
 
-    if ($logTableExists) {
-        $logStmt = $pdo->prepare(
-            'INSERT INTO order_item_logs
-            (order_item_id, order_id, listing_id, seller_id, action, old_status, new_status, actor_type, actor_id, note, ip_address, user_agent)
+function bvfa_mark_shipped_email_queued(PDO $pdo, int $orderItemId, int $sellerId): void
+{
+    if (!bvfa_table_exists($pdo, 'order_item_logs')) {
+        return;
+    }
+    try {
+        $stmt = $pdo->prepare("
+            INSERT INTO order_item_logs
+                (order_item_id, action, old_status, new_status, actor_type, actor_id, created_at)
             VALUES
-            (:order_item_id, :order_id, :listing_id, :seller_id, :action, :old_status, :new_status, :actor_type, :actor_id, :note, :ip_address, :user_agent)'
-        );
-        $logStmt->execute([
-            ':order_item_id' => $orderItemId,
-            ':order_id' => (int)($freshItem['order_id'] ?? 0),
-            ':listing_id' => (int)($freshItem['listing_id'] ?? 0),
-            ':seller_id' => $freshSellerId,
-            ':action' => $action,
-            ':old_status' => $freshStatus,
-            ':new_status' => $newStatus,
-            ':actor_type' => $isAdmin ? 'admin' : 'seller',
-            ':actor_id' => $actorId,
-            ':note' => $fulfillmentNote !== '' ? $fulfillmentNote : null,
-            ':ip_address' => isset($_SERVER['REMOTE_ADDR']) ? mb_substr((string)$_SERVER['REMOTE_ADDR'], 0, 45) : null,
-            ':user_agent' => isset($_SERVER['HTTP_USER_AGENT']) ? mb_substr((string)$_SERVER['HTTP_USER_AGENT'], 0, 255) : null,
+                (?, 'shipped_email_queued', 'shipped', 'shipped', 'seller', ?, NOW())
+        ");
+        $stmt->execute([$orderItemId, $sellerId]);
+    } catch (Throwable $e) {
+        bvfa_mail_log('shipped_email_mark_failed', [
+            'error'         => $e->getMessage(),
+            'order_item_id' => $orderItemId,
         ]);
     }
+}
 
-    $countsStmt = $pdo->prepare(
-        'SELECT
-            SUM(CASE WHEN fulfillment_status = "completed" THEN 1 ELSE 0 END) AS completed_count,
-            SUM(CASE WHEN fulfillment_status = "shipped" THEN 1 ELSE 0 END) AS shipped_count,
-            SUM(CASE WHEN fulfillment_status IN ("pending", "processing") THEN 1 ELSE 0 END) AS pending_processing_count,
-            COUNT(*) AS total_count
-         FROM order_items
-         WHERE order_id = ?'
-    );
-    $countsStmt->execute([(int)$freshItem['order_id']]);
-    $counts = $countsStmt->fetch(PDO::FETCH_ASSOC) ?: [];
+function bvfa_queue_shipped_email(array $ctx): array
+{
+    $buyerName  = trim((string)($ctx['buyer_name'] ?? ''));
+    $orderCode  = trim((string)($ctx['order_code'] ?? ('Order #' . $ctx['order_id'])));
+    $itemTitle  = trim((string)($ctx['item_title'] ?? ('Order item #' . $ctx['order_item_id'])));
+    $carrier    = trim((string)($ctx['carrier'] ?? ''));
+    $tracking   = trim((string)($ctx['tracking_number'] ?? ''));
+    $shippedAt  = trim((string)($ctx['shipped_at'] ?? gmdate('Y-m-d H:i:s') . ' UTC'));
+    $orderUrl   = (string)($ctx['order_url'] ?? bvfa_build_member_order_url((int)$ctx['order_id']));
+    $to         = (string)($ctx['buyer_email'] ?? '');
+    $greeting   = $buyerName !== '' ? $buyerName : 'Customer';
 
-    $completedCount = (int)($counts['completed_count'] ?? 0);
-    $shippedCount = (int)($counts['shipped_count'] ?? 0);
-    $pendingProcessingCount = (int)($counts['pending_processing_count'] ?? 0);
-    $totalCount = (int)($counts['total_count'] ?? 0);
+    $subject = 'Your Bettavaro order item has been shipped';
 
-    if ($totalCount > 0) {
-        if ($completedCount === $totalCount) {
-            $syncCompletedStmt = $pdo->prepare(
-                "UPDATE orders SET status = 'completed' WHERE id = ? AND status NOT IN ('cancelled', 'refunded')"
-            );
-            $syncCompletedStmt->execute([(int)$freshItem['order_id']]);
-        } elseif ($shippedCount > 0 && $pendingProcessingCount === 0) {
-            $syncShippedStmt = $pdo->prepare(
-                "UPDATE orders SET status = 'shipped' WHERE id = ? AND status IN ('paid','confirmed','processing','packing')"
-            );
-            $syncShippedStmt->execute([(int)$freshItem['order_id']]);
+    $esc = static fn(string $v): string => htmlspecialchars($v, ENT_QUOTES, 'UTF-8');
+
+    $html = "<html><body style='font-family:Arial,sans-serif;color:#222;'>"
+        . "<p>Dear " . $esc($greeting) . ",</p>"
+        . "<p>Great news! Your order item has been shipped.</p>"
+        . "<table style='border-collapse:collapse;margin:12px 0;'>"
+        . "<tr><td style='padding:4px 12px 4px 0;color:#555;'>Order</td><td><strong>" . $esc($orderCode) . "</strong></td></tr>"
+        . "<tr><td style='padding:4px 12px 4px 0;color:#555;'>Item</td><td>" . $esc($itemTitle) . "</td></tr>"
+        . "<tr><td style='padding:4px 12px 4px 0;color:#555;'>Tracking</td><td><strong>" . $esc($tracking) . "</strong></td></tr>"
+        . "<tr><td style='padding:4px 12px 4px 0;color:#555;'>Carrier</td><td>" . $esc($carrier ?: '—') . "</td></tr>"
+        . "<tr><td style='padding:4px 12px 4px 0;color:#555;'>Shipped</td><td>" . $esc($shippedAt) . "</td></tr>"
+        . "</table>"
+        . "<p><a href='" . $esc($orderUrl) . "' style='background:#1d4ed8;color:#fff;padding:10px 18px;border-radius:6px;text-decoration:none;display:inline-block;'>View Your Order</a></p>"
+        . "<p style='color:#888;font-size:13px;'>Thank you for shopping with Bettavaro.</p>"
+        . "</body></html>";
+
+    $text = "Dear {$greeting},\n\nYour order item has been shipped.\n\n"
+        . "Order: {$orderCode}\n"
+        . "Item: {$itemTitle}\n"
+        . "Tracking: {$tracking}\n"
+        . ($carrier !== '' ? "Carrier: {$carrier}\n" : '')
+        . "Shipped: {$shippedAt}\n\n"
+        . "View your order: {$orderUrl}\n\n"
+        . "Thank you for shopping with Bettavaro.";
+
+    $payload = [
+        'queue_key' => 'fulfillment_shipped_' . $ctx['order_item_id'],
+        'profile'   => 'default',
+        'to'        => $to,
+        'subject'   => $subject,
+        'html'      => $html,
+        'text'      => $text,
+        'meta'      => [
+            'event'           => 'fulfillment.shipped',
+            'order_id'        => (int)$ctx['order_id'],
+            'order_item_id'   => (int)$ctx['order_item_id'],
+            'tracking_number' => $tracking,
+        ],
+    ];
+
+    bvfa_load_mailer();
+
+    if (function_exists('bv_queue_mail')) {
+        bv_queue_mail($payload);
+        return ['sent' => true, 'method' => 'bv_queue_mail'];
+    }
+
+    // Fallback: PHP mail()
+    if ($to !== '' && filter_var($to, FILTER_VALIDATE_EMAIL)) {
+        $headers  = "MIME-Version: 1.0\r\n";
+        $headers .= "Content-Type: text/html; charset=UTF-8\r\n";
+        $headers .= "From: noreply@bettavaro.com\r\n";
+        @mail($to, $subject, $html, $headers);
+        return ['sent' => true, 'method' => 'mail'];
+    }
+
+    return ['sent' => false, 'method' => 'none'];
+}
+
+// ---------------------------------------------------------------------------
+
+try {
+    if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
+        throw new RuntimeException('Invalid request method.');
+    }
+
+    if (!bvfa_verify_csrf()) {
+        throw new RuntimeException('Invalid CSRF token.');
+    }
+
+    $pdo = bvfa_db();
+    $sellerId = bvfa_current_seller_id();
+
+    if ($sellerId <= 0) {
+        throw new RuntimeException('Seller session not found.');
+    }
+
+    $orderItemId = (int)($_POST['order_item_id'] ?? 0);
+    $action = strtolower(trim((string)($_POST['action'] ?? '')));
+
+    if ($orderItemId <= 0) {
+        throw new RuntimeException('Invalid order item.');
+    }
+
+    if (!in_array($action, ['process', 'ship', 'complete'], true)) {
+        throw new RuntimeException('Invalid fulfillment action.');
+    }
+
+    if (!bvfa_has_col($pdo, 'order_items', 'fulfillment_status')) {
+        throw new RuntimeException('Missing order_items.fulfillment_status column.');
+    }
+
+    $pdo->beginTransaction();
+
+    $item = bvfa_fetch_item_for_update($pdo, $orderItemId, $sellerId);
+
+    if (!$item) {
+        throw new RuntimeException('Order item not found or not owned by this seller.');
+    }
+
+    $orderId = (int)($item['order_id'] ?? 0);
+    $oldStatus = strtolower(trim((string)($item['fulfillment_status'] ?? 'pending')));
+    if ($oldStatus === '') {
+        $oldStatus = 'pending';
+    }
+
+    $orderStatus = strtolower(trim((string)($item['order_status'] ?? '')));
+    $paymentStatus = strtolower(trim((string)($item['payment_status'] ?? '')));
+
+    if (in_array($orderStatus, ['cancelled', 'refunded'], true)) {
+        throw new RuntimeException('This order is cancelled or refunded.');
+    }
+
+    $newStatus = $oldStatus;
+    $updates = [];
+    $params = [];
+
+    if ($action === 'process') {
+        if (!in_array($oldStatus, ['pending'], true)) {
+            throw new RuntimeException('This item cannot be moved to processing.');
         }
+
+        if (!in_array($orderStatus, ['paid', 'confirmed', 'processing'], true) && !in_array($paymentStatus, ['paid', 'confirmed', 'succeeded'], true)) {
+            throw new RuntimeException('Payment is not confirmed yet.');
+        }
+
+        $newStatus = 'processing';
+        $updates[] = "fulfillment_status = ?";
+        $params[] = $newStatus;
+
+        if (bvfa_has_col($pdo, 'order_items', 'processed_at')) {
+            $updates[] = "processed_at = NOW()";
+        }
+    }
+
+    if ($action === 'ship') {
+        if (!in_array($oldStatus, ['processing'], true)) {
+            throw new RuntimeException('Item must be processing before it can be shipped.');
+        }
+
+        $trackingNumber = trim((string)($_POST['tracking_number'] ?? ''));
+        $carrier = trim((string)($_POST['carrier'] ?? ''));
+
+        if ($trackingNumber === '') {
+            throw new RuntimeException('Tracking number is required.');
+        }
+
+        $newStatus = 'shipped';
+        $updates[] = "fulfillment_status = ?";
+        $params[] = $newStatus;
+
+        if (bvfa_has_col($pdo, 'order_items', 'tracking_number')) {
+            $updates[] = "tracking_number = ?";
+            $params[] = $trackingNumber;
+        }
+
+        if (bvfa_has_col($pdo, 'order_items', 'carrier')) {
+            $updates[] = "carrier = ?";
+            $params[] = $carrier;
+        }
+
+        if (bvfa_has_col($pdo, 'order_items', 'shipped_at')) {
+            $updates[] = "shipped_at = NOW()";
+        }
+    }
+
+    if ($action === 'complete') {
+        if (!in_array($oldStatus, ['shipped'], true)) {
+            throw new RuntimeException('Item must be shipped before it can be completed.');
+        }
+
+        $newStatus = 'completed';
+        $updates[] = "fulfillment_status = ?";
+        $params[] = $newStatus;
+
+        if (bvfa_has_col($pdo, 'order_items', 'completed_at')) {
+            $updates[] = "completed_at = NOW()";
+        }
+    }
+
+    if (!$updates) {
+        throw new RuntimeException('Nothing to update.');
+    }
+
+    $params[] = $orderItemId;
+
+    $sql = "UPDATE order_items SET " . implode(', ', $updates) . " WHERE id = ?";
+    $stmt = $pdo->prepare($sql);
+    $stmt->execute($params);
+
+    bvfa_log_item($pdo, $orderItemId, $action, $oldStatus, $newStatus, $sellerId);
+
+    if ($orderId > 0) {
+        bvfa_update_order_rollup($pdo, $orderId);
     }
 
     $pdo->commit();
 
-    seller_redirect_with_flash('success', 'Fulfillment updated successfully.', $fallbackUrl, $returnUrl);
+    // ------------------------------------------------------------------
+    // Shipped email — queued/sent after DB commit so the transaction is
+    // fully committed before any mail attempt. Failures do NOT roll back.
+    // ------------------------------------------------------------------
+    if ($action === 'ship') {
+        try {
+            $buyerEmail = bvfa_find_buyer_email($item);
+
+            if ($buyerEmail === '') {
+                bvfa_mail_log('missing_buyer_email', [
+                    'order_item_id' => $orderItemId,
+                    'order_id'      => $orderId,
+                ]);
+            } elseif (bvfa_shipped_email_already_queued($pdo, $orderItemId)) {
+                bvfa_mail_log('shipped_email_already_queued', [
+                    'order_item_id' => $orderItemId,
+                    'order_id'      => $orderId,
+                ]);
+            } else {
+                // Resolve item title — prefer oi columns, then listing, then snapshots
+                $itemTitle = '';
+                foreach (['title', 'name', 'item_title', 'product_name'] as $_tc) {
+                    if (isset($item[$_tc]) && trim((string)$item[$_tc]) !== '') {
+                        $itemTitle = trim((string)$item[$_tc]);
+                        break;
+                    }
+                }
+                if ($itemTitle === '' && isset($item['_listing_title']) && trim((string)$item['_listing_title']) !== '') {
+                    $itemTitle = trim((string)$item['_listing_title']);
+                }
+                if ($itemTitle === '' && isset($item['strain_snapshot']) && trim((string)$item['strain_snapshot']) !== '') {
+                    $itemTitle = trim((string)$item['strain_snapshot']);
+                }
+                if ($itemTitle === '') {
+                    $itemTitle = 'Order item #' . $orderItemId;
+                }
+
+                $shippedAtValue = isset($item['shipped_at']) && trim((string)$item['shipped_at']) !== ''
+                    ? trim((string)$item['shipped_at'])
+                    : gmdate('Y-m-d H:i:s') . ' UTC';
+
+                $emailCtx = [
+                    'order_id'        => $orderId,
+                    'order_item_id'   => $orderItemId,
+                    'order_code'      => trim((string)($item['order_code'] ?? '')),
+                    'buyer_name'      => trim((string)($item['_buyer_name'] ?? '')),
+                    'buyer_email'     => $buyerEmail,
+                    'item_title'      => $itemTitle,
+                    'carrier'         => $carrier,
+                    'tracking_number' => $trackingNumber,
+                    'shipped_at'      => $shippedAtValue,
+                    'order_url'       => bvfa_build_member_order_url($orderId),
+                ];
+
+                bvfa_mail_log('shipped_email_queue_attempt', [
+                    'order_item_id' => $orderItemId,
+                    'order_id'      => $orderId,
+                    'to'            => $buyerEmail,
+                ]);
+
+                $mailResult = bvfa_queue_shipped_email($emailCtx);
+
+                if ($mailResult['sent']) {
+                    bvfa_mark_shipped_email_queued($pdo, $orderItemId, $sellerId);
+                    bvfa_mail_log('shipped_email_queued', [
+                        'order_item_id' => $orderItemId,
+                        'order_id'      => $orderId,
+                        'method'        => $mailResult['method'],
+                        'to'            => $buyerEmail,
+                    ]);
+                } else {
+                    bvfa_mail_log('shipped_email_failed', [
+                        'order_item_id' => $orderItemId,
+                        'order_id'      => $orderId,
+                        'reason'        => 'mail_queue_not_available',
+                    ]);
+                    // Record in logs so duplicate check still works on retry
+                    bvfa_mark_shipped_email_queued($pdo, $orderItemId, $sellerId);
+                }
+            }
+        } catch (Throwable $mailEx) {
+            // Email failure must never affect shipment outcome
+            bvfa_mail_log('shipped_email_failed', [
+                'order_item_id' => $orderItemId,
+                'order_id'      => $orderId,
+                'error'         => $mailEx->getMessage(),
+            ]);
+        }
+    }
+    // ------------------------------------------------------------------
+
+    bvfa_flash('success', 'Fulfillment updated successfully.');
+    bvfa_redirect(bvfa_safe_return_url());
+
 } catch (Throwable $e) {
-    if ($pdo->inTransaction()) {
+    if (isset($pdo) && $pdo instanceof PDO && $pdo->inTransaction()) {
         $pdo->rollBack();
     }
 
-    seller_redirect_with_flash('error', $e->getMessage(), $fallbackUrl, $returnUrl);
+    bvfa_flash('error', $e->getMessage());
+    bvfa_redirect(bvfa_safe_return_url());
 }
